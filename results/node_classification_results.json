@@ -1,0 +1,20 @@
+{
+  "logistic_regression": {
+    "accuracy": 0.567,
+    "macro_precision": 0.5517,
+    "macro_recall": 0.5914,
+    "macro_f1": 0.5596
+  },
+  "label_propagation": {
+    "accuracy": 0.681,
+    "macro_precision": 0.6683,
+    "macro_recall": 0.7331,
+    "macro_f1": 0.6786
+  },
+  "gcn": {
+    "accuracy": 0.798,
+    "macro_precision": 0.7877,
+    "macro_recall": 0.8186,
+    "macro_f1": 0.7955
+  }
+}
