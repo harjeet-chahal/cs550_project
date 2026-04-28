@@ -1,0 +1,82 @@
+{
+  "node_id": 2267,
+  "predicted_class_idx": 1,
+  "predicted_class": "Genetic_Algorithms",
+  "true_class_idx": 1,
+  "true_class": "Genetic_Algorithms",
+  "confidence": 0.2730570211204022,
+  "class_probabilities": [
+    {
+      "class_idx": 1,
+      "probability": 0.2730570211204022,
+      "class_name": "Genetic_Algorithms"
+    },
+    {
+      "class_idx": 4,
+      "probability": 0.1484258742717112,
+      "class_name": "Reinforcement_Learning"
+    },
+    {
+      "class_idx": 2,
+      "probability": 0.1468223762434262,
+      "class_name": "Neural_Networks"
+    },
+    {
+      "class_idx": 5,
+      "probability": 0.12814187314253395,
+      "class_name": "Rule_Learning"
+    },
+    {
+      "class_idx": 3,
+      "probability": 0.11115040569037232,
+      "class_name": "Probabilistic_Methods"
+    },
+    {
+      "class_idx": 6,
+      "probability": 0.09623833795206889,
+      "class_name": "Theory"
+    },
+    {
+      "class_idx": 0,
+      "probability": 0.09616411157948528,
+      "class_name": "Case_Based"
+    }
+  ],
+  "top_influential_neighbors": [
+    {
+      "neighbor_id": 2196,
+      "confidence_drop": -0.10712247076350839,
+      "new_confidence": 0.3801794918839106,
+      "neighbor_true_label_idx": 1,
+      "neighbor_true_label": "Genetic_Algorithms"
+    }
+  ],
+  "top_important_features": [
+    {
+      "feature_idx": 495,
+      "confidence_drop": 0.021820711254926406,
+      "new_confidence": 0.2512363098654758
+    },
+    {
+      "feature_idx": 299,
+      "confidence_drop": 0.017875098438551895,
+      "new_confidence": 0.2551819226818503
+    },
+    {
+      "feature_idx": 140,
+      "confidence_drop": 0.016752270280072812,
+      "new_confidence": 0.2563047508403294
+    },
+    {
+      "feature_idx": 507,
+      "confidence_drop": 0.015423149854176699,
+      "new_confidence": 0.2576338712662255
+    },
+    {
+      "feature_idx": 99,
+      "confidence_drop": 0.008407021018970895,
+      "new_confidence": 0.2646500001014313
+    }
+  ],
+  "explanation": "Node 2267 was correctly classified as Genetic_Algorithms with 27.3% confidence. The most influential neighbor was node 2196 (Genetic_Algorithms) (\u0394conf=-0.107). The most important active feature was index 495 (\u0394conf=+0.022)."
+}

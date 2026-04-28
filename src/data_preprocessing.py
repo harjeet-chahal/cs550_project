@@ -28,6 +28,23 @@ CLASS_MAP = {
 }
 
 
+def count_raw_citations(cites_path=None):
+    """Count valid (non-empty, ≥2-token) lines in cora.cites — i.e. the
+    raw citation links *before* undirected deduplication. The raw file
+    has 5,429 such rows; after collapsing (A→B, B→A) duplicates and
+    exact repeats only 5,278 unique undirected edges remain. Both
+    numbers are reported throughout the project (console, demo,
+    README) so there is no ambiguity about which one is being used."""
+    if cites_path is None:
+        cites_path = os.path.join(CORA_DIR, 'cora.cites')
+    n = 0
+    with open(cites_path, 'r') as f:
+        for line in f:
+            if len(line.strip().split()) >= 2:
+                n += 1
+    return n
+
+
 def load_cora():
     content_path = os.path.join(CORA_DIR, 'cora.content')
     cites_path   = os.path.join(CORA_DIR, 'cora.cites')
@@ -82,7 +99,10 @@ def load_cora():
 
     edges = np.array(edge_list, dtype=np.int64)
 
-    print(f"[Data] Nodes: {N}  |  Edges: {len(edges)}  |  Features: {F}  |  Classes: {len(CLASS_MAP)}")
+    n_raw = count_raw_citations(cites_path)
+    print(f"[Data] Nodes: {N}  |  Raw citations: {n_raw}  |  "
+          f"Unique undirected edges: {len(edges)}  |  "
+          f"Features: {F}  |  Classes: {len(CLASS_MAP)}")
     print(f"[Data] Class distribution: {np.bincount(labels)}")
     return labels, edges, features
 
@@ -95,17 +115,50 @@ def build_adjacency(edges, n_nodes):
 
 
 def normalize_features(features):
-    rowsum = np.array(features.sum(1)).flatten()
-    rowsum[rowsum == 0] = 1
-    return sp.diags(1.0 / rowsum).dot(features)
+    """Row-l1 normalize a sparse feature matrix.
+
+    Zero-row guard: rows with no active features become 1 in the
+    denominator so the output row stays all-zero (instead of NaN /
+    Inf). Result is asserted to be finite.
+    """
+    rowsum = np.asarray(features.sum(1)).flatten().astype(np.float64)
+    rowsum[rowsum == 0] = 1.0
+    inv = 1.0 / rowsum
+    if not np.all(np.isfinite(inv)):
+        raise FloatingPointError(
+            "normalize_features: 1 / rowsum produced non-finite values"
+        )
+    out = sp.diags(inv).dot(features)
+    if not np.all(np.isfinite(out.data)):
+        raise FloatingPointError(
+            "normalize_features output contains NaN/Inf entries"
+        )
+    return out
 
 
 def normalize_adjacency(A):
+    """Symmetric normalization with self-loops: D^{-1/2}(A + I)D^{-1/2}.
+
+    Self-loops guarantee `deg >= 1` for every row, so `deg ** -0.5`
+    is finite. The clamp `max(deg, 1e-12)` is a defensive belt for
+    the case where an isolated graph is fed in without self-loops.
+    Result is asserted to be finite.
+    """
     n      = A.shape[0]
     A_hat  = A + sp.eye(n)
-    deg    = np.array(A_hat.sum(1)).flatten()
-    D_inv_sqrt = sp.diags(np.power(deg, -0.5))
-    return D_inv_sqrt.dot(A_hat).dot(D_inv_sqrt)
+    deg    = np.asarray(A_hat.sum(1)).flatten().astype(np.float64)
+    deg_inv_sqrt = np.power(np.maximum(deg, 1e-12), -0.5)
+    if not np.all(np.isfinite(deg_inv_sqrt)):
+        raise FloatingPointError(
+            "normalize_adjacency: D^{-1/2} produced non-finite values"
+        )
+    D_inv_sqrt = sp.diags(deg_inv_sqrt)
+    out = D_inv_sqrt.dot(A_hat).dot(D_inv_sqrt)
+    if not np.all(np.isfinite(out.data)):
+        raise FloatingPointError(
+            "normalize_adjacency output contains NaN/Inf entries"
+        )
+    return out
 
 
 def split_edges_link_prediction(edges, n_nodes, test_ratio=0.2, val_ratio=0.1):

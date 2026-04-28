@@ -6,17 +6,16 @@ Web application: node classification & link prediction inference
 from flask import Flask, render_template_string, request, jsonify
 import numpy as np
 import scipy.sparse as sp
-import sys, os, json
+import sys, os, json, pickle
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from data_preprocessing import (load_cora, build_adjacency, normalize_features,
-                                 normalize_adjacency, split_nodes_classification,
-                                 split_edges_link_prediction)
-from gcn_model import train_gcn, accuracy
-from link_prediction import (get_gcn_embeddings, edge_features_hadamard,
-                              train_link_predictor, predict_link_gcn,
-                              compute_heuristic_scores)
-from node_classification import label_propagation
+                                 normalize_adjacency)
+from gcn_model import GCN
+from link_prediction import predict_link_gcn
+from explainability import explain_node_prediction, explain_link_prediction
+
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), '..', 'results')
 
 app = Flask(__name__)
 
@@ -27,8 +26,49 @@ CLASS_NAMES = ['Case_Based','Genetic_Algorithms','Neural_Networks',
                'Probabilistic_Methods','Reinforcement_Learning',
                'Rule_Learning','Theory']
 
+REQUIRED_ARTIFACTS = {
+    'state':      'demo_state.pkl',
+    'splits':     'splits.npz',
+    'gcn':        'gcn_weights.npz',
+    'embeddings': 'gcn_embeddings.npy',
+    'probs':      'node_probabilities.npy',
+    'link_clf':   'link_classifier.pkl',
+    'lp_preds':   'lp_predictions.npy',
+    'lr_preds':   'lr_predictions.npy',
+}
+
+
+def _check_artifacts():
+    """Return ([] | [missing_paths]). Empty list ⇒ all good."""
+    paths = {k: os.path.join(RESULTS_DIR, fname)
+             for k, fname in REQUIRED_ARTIFACTS.items()}
+    missing = [(k, p) for k, p in paths.items() if not os.path.exists(p)]
+    return paths, missing
+
+
 def startup():
-    print("[Demo] Loading dataset and training model...")
+    """
+    Load all artifacts produced by `python src/main.py`. The demo does
+    NOT retrain anything: weights are loaded into reconstructed GCN
+    objects, embeddings / probabilities / baseline predictions come from
+    saved NumPy arrays, and the sklearn link classifier is unpickled.
+
+    If any required artifact is missing we exit immediately with a
+    clear, actionable error message.
+    """
+    paths, missing = _check_artifacts()
+    if missing:
+        print("\n[Demo] ERROR — required trained artifacts are missing:")
+        for _, p in missing:
+            print(f"          {p}")
+        print("\n  Train and save them first:")
+        print("          python src/main.py\n")
+        sys.exit(1)
+
+    print("[Demo] Loading saved artifacts (no retraining)...")
+
+    # Cora data is fast to reload and stays the source of truth for
+    # labels / edges / raw features (none of which we persist).
     labels, edges, features = load_cora()
     N = len(labels)
     A_full        = build_adjacency(edges, N)
@@ -36,35 +76,68 @@ def startup():
     X_dense       = features_norm.toarray()
     A_norm_full   = normalize_adjacency(A_full)
 
-    link_splits = split_edges_link_prediction(edges, N, test_ratio=0.2, val_ratio=0.1)
-    train_idx, val_idx, test_idx = split_nodes_classification(labels)
+    # ── Metadata + splits ────────────────────────────────────
+    with open(paths['state'], 'rb') as f:
+        meta = pickle.load(f)
+    splits = np.load(paths['splits'])
+    train_idx = splits['train_idx']
+    val_idx   = splits['val_idx']
+    test_idx  = splits['test_idx']
+    train_pos = splits['train_pos']
 
-    gcn_model, history = train_gcn(
-        A_norm_full, X_dense, labels, train_idx, val_idx, test_idx,
-        n_hidden=64, lr=0.01, epochs=300, weight_decay=5e-4,
-        dropout=0.5, patience=30, verbose=False
-    )
+    # ── GCN backbones reconstructed from saved weights ───────
+    weights = np.load(paths['gcn'])
+    gcn_model = GCN(meta['n_features'], meta['n_hidden'], meta['n_classes'])
+    gcn_model.W0 = weights['W0']
+    gcn_model.W1 = weights['W1']
+    gcn_lp_model = GCN(meta['n_features'], meta['n_hidden'], meta['n_classes'])
+    gcn_lp_model.W0 = weights['W0_lp']
+    gcn_lp_model.W1 = weights['W1_lp']
 
-    preds_full, Z = gcn_model.predict(A_norm_full, X_dense)
-    test_acc = accuracy(preds_full, labels, test_idx)
-    print(f"[Demo] GCN Test Accuracy: {test_acc:.4f}")
+    # ── Per-node arrays ──────────────────────────────────────
+    Z             = np.load(paths['probs'])
+    emb           = np.load(paths['embeddings'])
+    lp_preds_full = np.load(paths['lp_preds'])
+    lr_preds_full = np.load(paths['lr_preds'])
 
-    # Train link predictor
-    A_train       = link_splits['train_A']
-    A_norm_train  = normalize_adjacency(A_train)
-    emb = get_gcn_embeddings(gcn_model, A_norm_full, X_dense)
-    link_clf = train_link_predictor(emb, link_splits['train']['pos'], link_splits['train']['neg'])
+    # ── sklearn link classifier ──────────────────────────────
+    with open(paths['link_clf'], 'rb') as f:
+        link_clf = pickle.load(f)
+
+    # Build A_train from the saved train_pos (cheap; not persisted as
+    # a sparse matrix to keep things in pure NumPy / scipy.sparse).
+    A_train      = build_adjacency(train_pos, N)
+    A_norm_train = normalize_adjacency(A_train)
+
+    preds_full = np.argmax(Z, axis=1)
+    test_acc   = float(np.mean(preds_full[test_idx] == labels[test_idx]))
+    print(f"[Demo] GCN Test Accuracy (from saved Z): {test_acc:.4f}")
+    print(f"[Demo] LP threshold (from saved state):  {meta['link_threshold']:.4f}")
+
+    # `n_edges_unique` is `len(edges)` after load_cora dedups
+    # (A→B, B→A) pairs and exact duplicates from cora.cites. The raw
+    # count comes from main.py's saved state (5,429 in stock Cora).
+    n_edges_unique = len(edges)
+    n_edges_raw    = int(meta.get('n_edges_raw', n_edges_unique))
 
     STATE.update({
         'labels': labels, 'edges': edges, 'X_dense': X_dense,
         'A_full': A_full, 'A_norm': A_norm_full,
-        'gcn_model': gcn_model, 'Z': Z, 'preds': preds_full,
-        'embeddings': emb, 'link_clf': link_clf, 'link_splits': link_splits,
+        'A_train': A_train, 'A_norm_train': A_norm_train,
+        'gcn_model': gcn_model, 'gcn_lp_model': gcn_lp_model,
+        'Z': Z, 'preds': preds_full,
+        'embeddings': emb, 'link_clf': link_clf,
+        'link_threshold': float(meta['link_threshold']),
         'train_idx': train_idx, 'val_idx': val_idx, 'test_idx': test_idx,
-        'history': history, 'test_acc': test_acc,
-        'n_nodes': N, 'n_edges': len(edges),
+        'test_acc': test_acc,
+        'n_nodes': N,
+        'n_edges_unique': n_edges_unique,
+        'n_edges_raw':    n_edges_raw,
+        'lp_preds_full': lp_preds_full,
+        'lr_preds_full': lr_preds_full,
     })
-    print("[Demo] Ready!")
+    print(f"[Demo] Edges: {n_edges_raw} raw citations → {n_edges_unique} unique undirected edges.")
+    print("[Demo] Ready (loaded from disk, no retraining).")
 
 # ── HTML Template ──────────────────────────────────────────────
 HTML = r"""
@@ -226,10 +299,11 @@ HTML = r"""
 </header>
 
 <div class="stats-bar">
-  <div class="stat-item"><div class="stat-val" id="s-nodes">2708</div><div class="stat-label">Nodes (Papers)</div></div>
-  <div class="stat-item"><div class="stat-val" id="s-edges">5429</div><div class="stat-label">Edges (Citations)</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-nodes">2,708</div><div class="stat-label">Nodes (Papers)</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-edges-unique">5,278</div><div class="stat-label">Unique Edges Used</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-edges-raw">5,429</div><div class="stat-label">Raw Citations</div></div>
   <div class="stat-item"><div class="stat-val">7</div><div class="stat-label">Classes</div></div>
-  <div class="stat-item"><div class="stat-val">1433</div><div class="stat-label">Features</div></div>
+  <div class="stat-item"><div class="stat-val">1,433</div><div class="stat-label">Features</div></div>
   <div class="stat-item"><div class="stat-val" id="s-acc">—</div><div class="stat-label">GCN Test Acc</div></div>
 </div>
 
@@ -256,6 +330,21 @@ HTML = r"""
         <div id="nc-bars"></div>
         <div style="margin-top:16px;font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;">All Methods</div>
         <div class="methods-grid" id="nc-methods"></div>
+
+        <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Prediction Explanation</div>
+        <div id="nc-explain-text" style="margin-top:8px;font-size:13px;line-height:1.5;color:var(--text);"></div>
+
+        <div style="margin-top:14px;font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Top Influential Neighbors</div>
+        <table class="results-table" id="nc-neighbors">
+          <thead><tr><th>Node</th><th>Class</th><th>Δ Conf</th></tr></thead>
+          <tbody></tbody>
+        </table>
+
+        <div style="margin-top:14px;font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Top Important Features</div>
+        <table class="results-table" id="nc-features">
+          <thead><tr><th>Feature index</th><th>Δ Conf</th></tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -283,7 +372,10 @@ HTML = r"""
           <div id="lp-verdict">—</div>
         </div>
         <div class="link-score" id="lp-score"></div>
-        <div class="methods-grid" id="lp-methods" style="margin-top:14px;grid-template-columns:1fr 1fr 1fr;"></div>
+        <div class="methods-grid" id="lp-methods" style="margin-top:14px;grid-template-columns:1fr 1fr 1fr 1fr;"></div>
+
+        <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Link Explanation</div>
+        <div id="lp-explain-text" style="margin-top:8px;font-size:13px;line-height:1.5;color:var(--text);"></div>
       </div>
     </div>
   </div>
@@ -339,7 +431,8 @@ HTML = r"""
       <div>
         <div style="font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">Cora Dataset</div>
         <div class="info-pair"><span class="info-key">Nodes</span><span class="info-val">2,708</span></div>
-        <div class="info-pair"><span class="info-key">Edges</span><span class="info-val">5,429</span></div>
+        <div class="info-pair"><span class="info-key">Raw citations</span><span class="info-val" id="s-info-edges-raw">5,429</span></div>
+        <div class="info-pair"><span class="info-key">Unique edges</span><span class="info-val" id="s-info-edges-unique">5,278</span></div>
         <div class="info-pair"><span class="info-key">Features</span><span class="info-val">1,433 (BoW)</span></div>
         <div class="info-pair"><span class="info-key">Classes</span><span class="info-val">7 topics</span></div>
         <div class="info-pair"><span class="info-key">Train split</span><span class="info-val">20 per class</span></div>
@@ -360,11 +453,19 @@ HTML = r"""
 const CLASSES = {{ classes|tojson }};
 const COLORS  = ['#4e7cff','#7c4eff','#38d9a9','#ffa94d','#ff6b6b','#74c0fc','#a9e34b'];
 
+function isIntegerString(s) {
+  return /^-?\d+$/.test(String(s).trim());
+}
+
 async function classifyNode() {
-  const nodeId = parseInt(document.getElementById('node-id').value);
+  const raw    = document.getElementById('node-id').value;
   const errEl  = document.getElementById('nc-error');
   errEl.textContent = '';
-  if (isNaN(nodeId) || nodeId < 0 || nodeId > 2707) {
+  if (!isIntegerString(raw)) {
+    errEl.textContent = 'Node ID must be an integer.'; return;
+  }
+  const nodeId = parseInt(raw, 10);
+  if (nodeId < 0 || nodeId > 2707) {
     errEl.textContent = 'Node ID must be between 0 and 2707.'; return;
   }
   const btn = document.querySelector('#nc-result').previousElementSibling;
@@ -403,6 +504,26 @@ async function classifyNode() {
         <div class="method-pred" style="color:${m.color}">${m.pred}</div>
       </div>`).join('');
 
+    // ── Explanation panel ──
+    document.getElementById('nc-explain-text').textContent = data.explanation || '';
+
+    const nbrRows = (data.top_influential_neighbors || []).map(n => `
+      <tr>
+        <td>${n.neighbor_id}</td>
+        <td>${n.neighbor_true_label || '—'}</td>
+        <td class="metric-val">${(n.confidence_drop >= 0 ? '+' : '') + n.confidence_drop.toFixed(4)}</td>
+      </tr>`).join('');
+    document.querySelector('#nc-neighbors tbody').innerHTML =
+      nbrRows || '<tr><td colspan="3" style="color:var(--muted);text-align:center">No neighbors</td></tr>';
+
+    const featRows = (data.top_important_features || []).map(f => `
+      <tr>
+        <td>${f.feature_idx}</td>
+        <td class="metric-val">${(f.confidence_drop >= 0 ? '+' : '') + f.confidence_drop.toFixed(4)}</td>
+      </tr>`).join('');
+    document.querySelector('#nc-features tbody').innerHTML =
+      featRows || '<tr><td colspan="2" style="color:var(--muted);text-align:center">No active features</td></tr>';
+
     document.getElementById('nc-result').classList.add('show');
   } catch(e) {
     errEl.textContent = 'Request failed.';
@@ -412,14 +533,21 @@ async function classifyNode() {
 }
 
 async function predictLink() {
-  const src = parseInt(document.getElementById('lp-src').value);
-  const dst = parseInt(document.getElementById('lp-dst').value);
-  const errEl = document.getElementById('lp-error');
+  const rawSrc = document.getElementById('lp-src').value;
+  const rawDst = document.getElementById('lp-dst').value;
+  const errEl  = document.getElementById('lp-error');
   errEl.textContent = '';
-  if (isNaN(src)||isNaN(dst)||src<0||src>2707||dst<0||dst>2707) {
+  if (!isIntegerString(rawSrc) || !isIntegerString(rawDst)) {
+    errEl.textContent = 'Inputs must be integers.'; return;
+  }
+  const src = parseInt(rawSrc, 10);
+  const dst = parseInt(rawDst, 10);
+  if (src < 0 || src > 2707 || dst < 0 || dst > 2707) {
     errEl.textContent = 'Both node IDs must be between 0 and 2707.'; return;
   }
-  if (src === dst) { errEl.textContent = 'Source and target must differ.'; return; }
+  if (src === dst) {
+    errEl.textContent = 'Source and target must be different.'; return;
+  }
 
   const btn = document.querySelector('#lp-result').previousElementSibling;
   btn.innerHTML = '<span class="spinner"></span> Running...';
@@ -433,18 +561,47 @@ async function predictLink() {
     const exists = data.link_exists;
     const dot = document.getElementById('lp-dot');
     dot.className = 'link-dot ' + (exists ? 'link-yes' : 'link-no');
-    document.getElementById('lp-verdict').textContent = exists
-      ? '✅ Link Likely Exists'  : '❌ Link Likely Does Not Exist';
+
+    // Borderline = the GCN probability sits within 0.05 of the
+    // validation-tuned decision threshold. Show the threshold next
+    // to the probability and label borderline cases explicitly.
+    const threshold  = (typeof data.threshold === 'number') ? data.threshold : 0.5;
+    const margin     = data.gcn_prob - threshold;
+    const borderline = Math.abs(margin) < 0.05;
+    let verdict;
+    if (exists) {
+      verdict = borderline ? '⚠️ Predicted Link: Yes (Borderline)'
+                           : '✅ Predicted Link: Yes';
+    } else {
+      verdict = borderline ? '⚠️ Predicted Link: No (Borderline)'
+                           : '❌ Predicted Link: No';
+    }
+    document.getElementById('lp-verdict').textContent = verdict;
     document.getElementById('lp-score').innerHTML =
       `GCN+LR probability: <b>${(data.gcn_prob*100).toFixed(1)}%</b> &nbsp;|&nbsp; `+
+      `Decision threshold: <b>${(threshold*100).toFixed(1)}%</b> &nbsp;|&nbsp; `+
       `Actual: <b>${data.actual_link ? 'Yes' : 'No'}</b>`;
 
     document.getElementById('lp-methods').innerHTML = [
-      {name:'GCN + LR', val: `${(data.gcn_prob*100).toFixed(1)}%`},
+      {name:'GCN + LR',    val: `${(data.gcn_prob*100).toFixed(1)}%`},
       {name:'Adamic-Adar', val: data.aa_score.toFixed(3)},
-      {name:'Common N.', val: data.cn_score},
+      {name:'Common N.',   val: data.cn_score},
+      {name:'Jaccard',     val: (data.jaccard ?? 0).toFixed(3)},
     ].map(m => `<div class="method-card"><div class="method-name">${m.name}</div>
        <div class="method-pred" style="color:var(--accent)">${m.val}</div></div>`).join('');
+
+    // Embedding cosine + natural-language summary.
+    let explanationText = data.explanation || '';
+    if (borderline) {
+      const direction = margin >= 0 ? 'above' : 'below';
+      explanationText += ` The probability is only slightly ${direction} `+
+                         `the validation-tuned threshold, so this is a `+
+                         `borderline decision.`;
+    }
+    document.getElementById('lp-explain-text').innerHTML =
+      `<div style="margin-bottom:8px;color:var(--muted)">`+
+      `Embedding cosine similarity: <b style="color:var(--text)">${(data.embedding_cosine ?? 0).toFixed(3)}</b></div>`+
+      explanationText;
 
     document.getElementById('lp-result').classList.add('show');
   } catch(e) {
@@ -461,6 +618,18 @@ async function loadSummary() {
     const data = await res.json();
 
     document.getElementById('s-acc').textContent = (data.test_acc * 100).toFixed(1) + '%';
+    const fmt = n => (n || 0).toLocaleString();
+    if (data.n_nodes) {
+      document.getElementById('s-nodes').textContent = fmt(data.n_nodes);
+    }
+    if (data.n_edges_unique) {
+      document.getElementById('s-edges-unique').textContent      = fmt(data.n_edges_unique);
+      document.getElementById('s-info-edges-unique').textContent = fmt(data.n_edges_unique);
+    }
+    if (data.n_edges_raw) {
+      document.getElementById('s-edges-raw').textContent      = fmt(data.n_edges_raw);
+      document.getElementById('s-info-edges-raw').textContent = fmt(data.n_edges_raw);
+    }
 
     // NC table
     const NC_LABELS = {logistic_regression:'Logistic Regression', label_propagation:'Label Propagation', gcn:'GCN (ours)'};
@@ -513,85 +682,140 @@ def summary():
         with open(nc_path) as f: nc_results = json.load(f)
     if os.path.exists(lp_path):
         with open(lp_path) as f: lp_results = json.load(f)
-    return jsonify({'test_acc': float(STATE.get('test_acc', 0)), 'nc_results': nc_results, 'lp_results': lp_results})
+    return jsonify({
+        'test_acc':       float(STATE.get('test_acc', 0)),
+        'n_nodes':        int(STATE.get('n_nodes', 0)),
+        'n_edges_raw':    int(STATE.get('n_edges_raw', 0)),
+        'n_edges_unique': int(STATE.get('n_edges_unique', 0)),
+        'nc_results': nc_results,
+        'lp_results': lp_results,
+    })
+
+
+def _coerce_int(value):
+    """Best-effort int coercion that rejects floats with fractional parts
+    and non-numeric strings. Returns (int, None) or (None, error_msg)."""
+    if isinstance(value, bool):
+        return None, 'must be an integer'
+    if isinstance(value, int):
+        return int(value), None
+    if isinstance(value, float):
+        if not value.is_integer():
+            return None, 'must be an integer (no decimals)'
+        return int(value), None
+    if isinstance(value, str):
+        s = value.strip()
+        if s and (s.lstrip('-').isdigit()):
+            return int(s), None
+        return None, 'must be an integer'
+    return None, 'must be an integer'
 
 
 @app.route('/classify', methods=['POST'])
 def classify():
-    data    = request.get_json()
-    node_id = int(data.get('node_id', 0))
-    if node_id < 0 or node_id >= STATE['n_nodes']:
-        return jsonify({'error': f'Node ID out of range (0–{STATE["n_nodes"]-1})'})
+    data    = request.get_json(silent=True) or {}
+    N       = STATE['n_nodes']
+
+    node_id, err = _coerce_int(data.get('node_id'))
+    if err is not None:
+        return jsonify({'error': f'Node ID {err}.'})
+    if node_id < 0 or node_id >= N:
+        return jsonify({'error': f'Node ID must be between 0 and {N - 1}.'})
 
     labels    = STATE['labels']
     gcn_model = STATE['gcn_model']
     A_norm    = STATE['A_norm']
-    X_dense   = STATE['X_dense']
     A_full    = STATE['A_full']
+    X_dense   = STATE['X_dense']
 
-    # GCN prediction
-    Z     = STATE['Z']
-    probs = Z[node_id].tolist()
+    # GCN softmax row from the cached startup forward.
+    Z        = STATE['Z']
+    probs    = Z[node_id].tolist()
     pred_gcn = int(np.argmax(Z[node_id]))
 
-    # Label Propagation
-    from node_classification import label_propagation
-    lp_preds, _ = label_propagation(A_full, labels, STATE['train_idx'], 7)
-    pred_lp = int(lp_preds[node_id])
+    # Cached baseline predictions (computed once at startup).
+    pred_lp = int(STATE['lp_preds_full'][node_id])
+    pred_lr = int(STATE['lr_preds_full'][node_id])
 
-    # Logistic Regression
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import normalize
-    X_norm = normalize(X_dense, norm='l1')
-    clf_lr = LogisticRegression(max_iter=300, C=1.0)
-    clf_lr.fit(X_norm[STATE['train_idx']], labels[STATE['train_idx']])
-    pred_lr = int(clf_lr.predict(X_norm[node_id:node_id+1])[0])
+    # Occlusion-based explanation (top neighbors + features + summary).
+    explanation = explain_node_prediction(
+        gcn_model, node_id, X_dense,
+        adjacency_norm=A_norm, adjacency_raw=A_full,
+        labels=labels, class_names=CLASS_NAMES, top_k=5,
+    )
 
     return jsonify({
         'node_id':    node_id,
-        'true_label': CLASS_NAMES[labels[node_id]],
+        'true_label': CLASS_NAMES[int(labels[node_id])],
         'gcn_pred':   CLASS_NAMES[pred_gcn],
         'gcn_probs':  probs,
         'gcn_idx':    pred_gcn,
         'lp_pred':    CLASS_NAMES[pred_lp],
         'lr_pred':    CLASS_NAMES[pred_lr],
+        # New explanation fields.
+        'confidence':                explanation.get('confidence'),
+        'class_probabilities':       explanation.get('class_probabilities', []),
+        'top_influential_neighbors': explanation.get('top_influential_neighbors', []),
+        'top_important_features':    explanation.get('top_important_features', []),
+        'explanation':               explanation.get('explanation', ''),
     })
 
 
 @app.route('/predict_link', methods=['POST'])
 def predict_link():
-    data = request.get_json()
-    src  = int(data.get('src', 0))
-    dst  = int(data.get('dst', 1))
+    data = request.get_json(silent=True) or {}
     N    = STATE['n_nodes']
+
+    src, err_s = _coerce_int(data.get('src'))
+    if err_s is not None:
+        return jsonify({'error': f'Source ID {err_s}.'})
+    dst, err_d = _coerce_int(data.get('dst'))
+    if err_d is not None:
+        return jsonify({'error': f'Target ID {err_d}.'})
     if src < 0 or src >= N or dst < 0 or dst >= N:
-        return jsonify({'error': f'Node IDs must be between 0 and {N-1}'})
+        return jsonify({'error': f'Node IDs must be between 0 and {N - 1}.'})
+    if src == dst:
+        return jsonify({'error': 'Source and target must be different.'})
 
-    A_full  = STATE['A_full']
-    emb     = STATE['embeddings']
-    clf     = STATE['link_clf']
-    edges   = STATE['edges']
-    edge_set = set(map(tuple, [( min(u,v), max(u,v)) for u,v in edges]))
+    A_train   = STATE['A_train']
+    A_full    = STATE['A_full']
+    emb       = STATE['embeddings']         # extracted via A_norm_train
+    clf       = STATE['link_clf']
+    labels    = STATE['labels']
+    threshold = STATE.get('link_threshold', 0.5)
 
-    # GCN + LR
-    pair = np.array([[src, dst]])
-    gcn_prob = float(predict_link_gcn(clf, emb, pair)[0])
-    link_exists = gcn_prob >= 0.5
+    # Delegate everything to the link explainer (heuristics use A_train,
+    # full adjacency only used for `edge_exists`).
+    expl = explain_link_prediction(
+        src, dst,
+        embeddings=emb,
+        adjacency_train=A_train,
+        adjacency_full=A_full,
+        link_model=clf,
+        class_names=CLASS_NAMES,
+        labels=labels,
+    )
+    if 'error' in expl:
+        return jsonify({'error': expl['error']})
 
-    # Adamic-Adar
-    from link_prediction import adamic_adar_score, common_neighbors_score
-    aa_score = adamic_adar_score(A_full, src, dst)
-    cn_score = common_neighbors_score(A_full, src, dst)
-
-    actual = (min(src,dst), max(src,dst)) in edge_set
-
+    gcn_prob = float(expl['gcn_link_probability'])
     return jsonify({
-        'src': src, 'dst': dst,
-        'gcn_prob': gcn_prob,
-        'link_exists': link_exists,
-        'aa_score': aa_score,
-        'cn_score': int(cn_score),
-        'actual_link': actual,
+        'src':              src,
+        'dst':              dst,
+        'gcn_prob':         gcn_prob,
+        # Strict `>` matches the rule used by tune_threshold /
+        # evaluate_scores_with_threshold so a probability sitting
+        # exactly on the threshold isn't auto-classified as positive.
+        'link_exists':      gcn_prob > threshold,
+        'threshold':        float(threshold),
+        'aa_score':         expl['adamic_adar'],
+        'cn_score':         int(expl['common_neighbors']),
+        'jaccard':          expl['jaccard'],
+        'embedding_cosine': expl['embedding_cosine'],
+        'actual_link':      bool(expl['edge_exists']),
+        'src_label':        expl.get('src_label'),
+        'dst_label':        expl.get('dst_label'),
+        'explanation':      expl['explanation'],
     })
 
 

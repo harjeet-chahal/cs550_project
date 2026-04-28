@@ -18,6 +18,8 @@ from sklearn.metrics import (
     confusion_matrix, accuracy_score
 )
 
+from gcn_model import safe_blas, _assert_finite
+
 
 # ─────────────────────────────────────────────────────────────────
 # Baseline: Logistic Regression on raw features
@@ -29,10 +31,14 @@ def run_logistic_regression(X, labels, train_idx, test_idx):
         X_dense = X.toarray()
     else:
         X_dense = np.array(X)
+    _assert_finite(X_dense, 'LR baseline input X')
 
-    clf = LogisticRegression(max_iter=500, solver='lbfgs', C=1.0)
-    clf.fit(X_dense[train_idx], labels[train_idx])
-    preds = clf.predict(X_dense[test_idx])
+    # See `safe_blas` docstring — sklearn's matmul triggers spurious
+    # BLAS FPE warnings on macOS Accelerate. Inputs are finite-checked.
+    with safe_blas():
+        clf = LogisticRegression(max_iter=500, solver='lbfgs', C=1.0)
+        clf.fit(X_dense[train_idx], labels[train_idx])
+        preds = clf.predict(X_dense[test_idx])
     return preds, clf
 
 

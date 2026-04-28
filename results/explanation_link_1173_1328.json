@@ -1,0 +1,13 @@
+{
+  "src": 1173,
+  "dst": 1328,
+  "gcn_link_probability": 0.7110145615625025,
+  "common_neighbors": 0,
+  "jaccard": 0.0,
+  "adamic_adar": 0.0,
+  "embedding_cosine": 0.8328886294432661,
+  "edge_exists": true,
+  "src_label": "Theory",
+  "dst_label": "Neural_Networks",
+  "explanation": "The model predicts a high-probability link (71.1%) between papers 1173 and 1328 mainly because the learned GCN embeddings are highly similar (cosine=0.833). Traditional structural heuristics do not strongly support this link, since the papers share 0 common neighbors and have Jaccard/Adamic-Adar scores of 0. Source class: Theory; target class: Neural_Networks. This edge IS present in the original citation graph."
+}

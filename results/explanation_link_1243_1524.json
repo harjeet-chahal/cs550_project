@@ -1,0 +1,13 @@
+{
+  "src": 1243,
+  "dst": 1524,
+  "gcn_link_probability": 0.49333270643176674,
+  "common_neighbors": 1,
+  "jaccard": 0.2,
+  "adamic_adar": 0.6213349345596119,
+  "embedding_cosine": 0.9058378382747038,
+  "edge_exists": true,
+  "src_label": "Neural_Networks",
+  "dst_label": "Neural_Networks",
+  "explanation": "The model predicts a moderate-probability link (49.3%) between papers 1243 and 1524 because they share 1 common neighbor, have a Jaccard score of 0.200, an Adamic-Adar score of 0.621, and their GCN embeddings are highly similar (cosine=0.906). Source class: Neural_Networks; target class: Neural_Networks. This edge IS present in the original citation graph."
+}

@@ -1,0 +1,14 @@
+# CS550 Project — runtime dependencies
+# Install with:  pip install -r requirements.txt
+
+# Core scientific stack (numpy GCN + heuristics + visualization)
+numpy>=1.20
+scipy>=1.7
+scikit-learn>=1.0
+matplotlib>=3.5
+
+# Web demo (Flask renders the live inference UI in demo/app.py)
+flask>=2.0
+
+# Test suite (pytest discovers tests/ from the project root)
+pytest>=7.0

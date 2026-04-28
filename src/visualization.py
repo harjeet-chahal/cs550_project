@@ -235,12 +235,240 @@ def plot_graph_statistics(edges, labels, save_path=None):
     return path
 
 
+def plot_node_explanation(explanation, save_path=None):
+    """Three-panel figure for one node's explanation:
+       1. class probability bars,
+       2. top influential neighbors (Δ confidence after edge occlusion),
+       3. top important active features (Δ confidence after feature occlusion).
+
+    `explanation` is the dict returned by
+    `explainability.explain_node_prediction`."""
+    probs = explanation.get('class_probabilities', [])
+    nbrs  = explanation.get('top_influential_neighbors', [])
+    feats = explanation.get('top_important_features', [])
+
+    node_id = explanation.get('node_id', '?')
+    pred    = explanation.get('predicted_class', '?')
+    true_   = explanation.get('true_class', '?')
+    conf    = explanation.get('confidence', 0.0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+
+    # ── Panel 1: class probabilities (sorted desc by the explainer) ──
+    ax = axes[0]
+    if probs:
+        names = [p.get('class_name', f"C{p['class_idx']}") for p in probs]
+        vals  = [p['probability'] for p in probs]
+        bars = ax.bar(range(len(vals)), vals,
+                      color=COLORS[:len(vals)], alpha=0.85)
+        ax.set_xticks(range(len(vals)))
+        ax.set_xticklabels([n[:12] for n in names],
+                           rotation=30, ha='right', fontsize=9)
+        for b, v in zip(bars, vals):
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.02,
+                    f'{v:.2f}', ha='center', va='bottom', fontsize=9)
+    ax.set_ylabel('Probability', fontsize=11)
+    ax.set_title('Class probabilities', fontsize=12, fontweight='bold')
+    ax.set_ylim(0, 1.10)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    # ── Panel 2: neighbor influence (Δ conf after edge occlusion) ──
+    ax = axes[1]
+    if nbrs:
+        labels_n = [
+            f"{n['neighbor_id']}\n({(n.get('neighbor_true_label') or '?')[:10]})"
+            for n in nbrs
+        ]
+        drops = [n['confidence_drop'] for n in nbrs]
+        # Green when removing the neighbor lowers confidence (it helped),
+        # red when it raises confidence (it argued against the prediction).
+        bar_colors = ['#55A868' if d >= 0 else '#C44E52' for d in drops]
+        bars = ax.bar(range(len(drops)), drops, color=bar_colors, alpha=0.85)
+        ax.set_xticks(range(len(drops)))
+        ax.set_xticklabels(labels_n, fontsize=9)
+        for b, v in zip(bars, drops):
+            ax.text(b.get_x() + b.get_width() / 2,
+                    b.get_height() + (0.002 if v >= 0 else -0.002),
+                    f'{v:+.3f}',
+                    ha='center', va='bottom' if v >= 0 else 'top', fontsize=9)
+    ax.set_ylabel('Δ confidence', fontsize=11)
+    ax.set_title('Top influential neighbors', fontsize=12, fontweight='bold')
+    ax.axhline(0, color='gray', linewidth=0.5)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    # ── Panel 3: feature importance (Δ conf after feature occlusion) ──
+    ax = axes[2]
+    if feats:
+        labels_f = [f"feat {f['feature_idx']}" for f in feats]
+        drops = [f['confidence_drop'] for f in feats]
+        bar_colors = ['#55A868' if d >= 0 else '#C44E52' for d in drops]
+        bars = ax.bar(range(len(drops)), drops, color=bar_colors, alpha=0.85)
+        ax.set_xticks(range(len(drops)))
+        ax.set_xticklabels(labels_f, rotation=30, ha='right', fontsize=9)
+        for b, v in zip(bars, drops):
+            ax.text(b.get_x() + b.get_width() / 2,
+                    b.get_height() + (0.002 if v >= 0 else -0.002),
+                    f'{v:+.3f}',
+                    ha='center', va='bottom' if v >= 0 else 'top', fontsize=9)
+    ax.set_ylabel('Δ confidence', fontsize=11)
+    ax.set_title('Top important active features', fontsize=12, fontweight='bold')
+    ax.axhline(0, color='gray', linewidth=0.5)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    suptitle = (f"Node {node_id} explanation — predicted: {pred} "
+                f"({conf * 100:.1f}%) | true: {true_}")
+    fig.suptitle(suptitle, fontsize=13, fontweight='bold', y=1.02)
+
+    plt.tight_layout()
+    path = save_path or os.path.join(RESULTS_DIR, 'explain_node_example.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {path}")
+    return path
+
+
+def plot_link_explanation(explanation, save_path=None):
+    """Two-panel summary for a (u, v) link explanation. The metrics live
+    on different scales (Jaccard / cosine / GCN prob ∈ [0, 1] but CN is a
+    raw count and Adamic-Adar is unbounded), so we split them.
+
+    `explanation` is the dict returned by
+    `explainability.explain_link_prediction`."""
+    src = explanation.get('src', '?')
+    dst = explanation.get('dst', '?')
+    actual = explanation.get('edge_exists', False)
+
+    cn  = explanation.get('common_neighbors', 0)
+    jc  = explanation.get('jaccard', 0.0)
+    aa  = explanation.get('adamic_adar', 0.0)
+    cos = explanation.get('embedding_cosine', 0.0)
+    gcn = explanation.get('gcn_link_probability')
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    # ── Panel 1: bounded scores in [0, 1] ──
+    bounded = [('Jaccard', jc), ('Cosine', cos)]
+    if gcn is not None:
+        bounded.append(('GCN prob', float(gcn)))
+    names1, vals1 = zip(*bounded)
+    bars = ax1.bar(range(len(vals1)), vals1,
+                   color=COLORS[:len(vals1)], alpha=0.85)
+    ax1.set_xticks(range(len(vals1)))
+    ax1.set_xticklabels(names1, fontsize=10)
+    ax1.set_ylabel('Score', fontsize=11)
+    ax1.set_ylim(0, 1.10)
+    ax1.set_title('Bounded scores ([0, 1])', fontsize=12, fontweight='bold')
+    ax1.grid(True, axis='y', alpha=0.3)
+    for b, v in zip(bars, vals1):
+        ax1.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.02,
+                 f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+
+    # ── Panel 2: counts (CN integer) and Adamic-Adar (unbounded) ──
+    counts = [('Common Neighbors', float(cn)), ('Adamic-Adar', float(aa))]
+    names2, vals2 = zip(*counts)
+    bars = ax2.bar(range(len(vals2)), vals2,
+                   color=[COLORS[3], COLORS[4]], alpha=0.85)
+    ax2.set_xticks(range(len(vals2)))
+    ax2.set_xticklabels(names2, fontsize=10)
+    ax2.set_ylabel('Score', fontsize=11)
+    ax2.set_title('Heuristic scores (unbounded)', fontsize=12, fontweight='bold')
+    ax2.grid(True, axis='y', alpha=0.3)
+    headroom = max(vals2) * 0.05 if max(vals2) > 0 else 0.05
+    ax2.set_ylim(0, max(vals2) + headroom * 4 if max(vals2) > 0 else 1)
+    for b, v in zip(bars, vals2):
+        # CN is conceptually an integer; render it as such.
+        label = f'{int(v)}' if abs(v - round(v)) < 1e-9 else f'{v:.3f}'
+        ax2.text(b.get_x() + b.get_width() / 2, b.get_height() + headroom,
+                 label, ha='center', va='bottom', fontsize=9)
+
+    edge_msg = ("edge present in graph" if actual
+                else "edge absent from graph")
+    suptitle = f"Link explanation: ({src}, {dst}) — {edge_msg}"
+    fig.suptitle(suptitle, fontsize=13, fontweight='bold', y=1.02)
+
+    plt.tight_layout()
+    path = save_path or os.path.join(RESULTS_DIR, 'explain_link_example.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {path}")
+    return path
+
+
+def plot_robustness_f1(robustness_results, task='nc', save_path=None):
+    """Two-panel figure for one task ('nc' or 'lp'):
+       top    — F1 vs perturbation rate, one line per perturbation type;
+       bottom — F1 drop (baseline − perturbed) vs rate, same lines.
+
+    `robustness_results` is the dict returned by
+    `robustness.run_robustness_experiments`."""
+    if task not in ('nc', 'lp'):
+        raise ValueError("task must be 'nc' or 'lp'")
+
+    panels = [
+        ('edge_removal',  'Edge removal'),
+        ('edge_addition', 'Fake edge addition'),
+        ('feature_noise', 'Feature noise'),
+    ]
+    base_f1 = robustness_results['baseline'][task]['f1']
+
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+    for i, (key, name) in enumerate(panels):
+        bucket = robustness_results[key]
+        # Sort the rate-keyed sub-dict ascending.
+        levels = sorted(bucket.keys(), key=lambda k: bucket[k]['rate'])
+        rates_pct = [0.0] + [bucket[k]['rate'] * 100 for k in levels]
+        f1_vals   = [base_f1] + [bucket[k][task]['f1'] for k in levels]
+        drops     = [0.0]     + [base_f1 - bucket[k][task]['f1'] for k in levels]
+
+        ax_top.plot(rates_pct, f1_vals, '-o', color=COLORS[i],
+                    linewidth=2, markersize=7, label=name)
+        ax_bot.plot(rates_pct, drops,   '-o', color=COLORS[i],
+                    linewidth=2, markersize=7, label=name)
+
+    # Baseline reference on the F1 panel.
+    ax_top.axhline(base_f1, color='gray', linestyle='--', alpha=0.5,
+                   label=f'Baseline F1 = {base_f1:.3f}')
+
+    title_task = 'Node Classification' if task == 'nc' else 'Link Prediction'
+    y_label    = 'Macro F1' if task == 'nc' else 'F1'
+
+    ax_top.set_ylabel(y_label, fontsize=11)
+    ax_top.set_ylim(0, 1.05)
+    ax_top.set_title(f'{title_task} F1 vs perturbation level',
+                     fontsize=12, fontweight='bold')
+    ax_top.legend(fontsize=9, loc='lower left')
+    ax_top.grid(True, alpha=0.3)
+
+    ax_bot.axhline(0, color='gray', linewidth=0.5)
+    ax_bot.set_xlabel('Perturbation rate (%)', fontsize=11)
+    ax_bot.set_ylabel('F1 drop (baseline − attacked)', fontsize=11)
+    ax_bot.set_title(f'{title_task} robustness drop',
+                     fontsize=12, fontweight='bold')
+    ax_bot.legend(fontsize=9, loc='upper left')
+    ax_bot.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    suffix = 'node' if task == 'nc' else 'link'
+    path = save_path or os.path.join(RESULTS_DIR, f'robustness_{suffix}_f1.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {path}")
+    return path
+
+
 def plot_embedding_tsne(embeddings, labels, save_path=None, title='GCN Node Embeddings (t-SNE)'):
     """2D t-SNE visualization of node embeddings colored by class."""
     from sklearn.manifold import TSNE
+    from gcn_model import safe_blas, _assert_finite
+    _assert_finite(embeddings, 't-SNE input embeddings')
     print("  Running t-SNE on embeddings (this may take a moment)...")
     tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=300)
-    emb_2d = tsne.fit_transform(embeddings)
+    # t-SNE internally does many matmuls on potentially zero-heavy
+    # arrays — same Accelerate BLAS spurious-FPE issue as sklearn's LR.
+    with safe_blas():
+        emb_2d = tsne.fit_transform(embeddings)
+    _assert_finite(emb_2d, 't-SNE output')
 
     n_classes = int(labels.max()) + 1
     fig, ax = plt.subplots(figsize=(9, 7))

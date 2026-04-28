@@ -13,6 +13,51 @@ where:
 """
 
 import numpy as np
+import scipy.sparse as sp
+import contextlib
+
+
+@contextlib.contextmanager
+def safe_blas():
+    """Targeted suppression of NumPy 2.x BLAS spurious-FPE warnings.
+
+    On macOS Accelerate (and some other BLAS builds) NumPy ≥ 2.0 raises
+    "divide by zero / overflow / invalid value encountered in matmul"
+    RuntimeWarnings whenever an operand has many explicit zeros — which
+    happens for every sparse-feature graph and every BoW classifier
+    fit. The math is correct (we verify with `_assert_finite` on inputs
+    and outputs), only the wrapper is noisy. We swap our own `@` to
+    `np.dot` to dodge it inside the GCN, but inside library code
+    (sklearn, t-SNE) we have no choice but to scope-suppress.
+
+    USE THIS ONLY AROUND LIBRARY CALLS, never around your own code.
+    Wrap with `_assert_finite(...)` checks on inputs/outputs so that
+    a real numerical issue (NaN/Inf) is still caught.
+    """
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        yield
+
+
+def _assert_finite(arr, name):
+    """Raise FloatingPointError with a useful message on NaN / Inf.
+
+    Used at every key intermediate (AX, H0, H1, AH1, logits, Z, embeddings,
+    weights, gradients) so any genuine numerical blow-up — gradient
+    explosion, weight overflow, dtype clash, sparse-to-dense mishap — is
+    caught immediately at the offending step rather than producing
+    silent garbage downstream.
+    """
+    if hasattr(arr, 'data'):  # sparse matrix
+        data = arr.data
+    else:
+        data = np.asarray(arr)
+    if not np.all(np.isfinite(data)):
+        n_nan = int(np.isnan(data).sum())
+        n_inf = int(np.isinf(data).sum())
+        raise FloatingPointError(
+            f"non-finite values in '{name}': nan={n_nan}, inf={n_inf}, "
+            f"dtype={data.dtype}, shape={getattr(arr, 'shape', None)}"
+        )
 
 
 def relu(x):
@@ -76,15 +121,33 @@ class GCN:
         A_norm: dense or sparse (N x N)
         X     : dense or sparse feature matrix (N x F)
         Returns probability matrix Z (N x C)
+
+        Numerical-stability notes
+        -------------------------
+        Dense @ dense is performed via `np.dot` rather than `@` /
+        `np.matmul`. On macOS Accelerate (and some other BLAS builds)
+        NumPy 2.x's matmul wrapper raises spurious "divide by zero /
+        overflow / invalid value encountered in matmul" RuntimeWarnings
+        when one operand has many explicit zero entries (which
+        AX = A_norm @ X always does for sparse-feature graphs like
+        Cora). The output is mathematically correct but the warning
+        chatter is noise — `np.dot` uses BLAS gemm directly without
+        that wrapper, so the warnings disappear while the results stay
+        identical. Softmax is computed on row-max-subtracted logits
+        (see `softmax`).
         """
         # Layer 1: A @ X @ W0
         if hasattr(X, 'toarray'):
             AX = A_norm.dot(X).toarray()
         else:
             AX = A_norm.dot(X) if hasattr(A_norm, 'dot') else A_norm @ X
+        AX = np.ascontiguousarray(AX)
+        _assert_finite(AX, 'AX')
 
-        H0 = AX @ self.W0                  # (N x hidden)
+        H0 = np.dot(AX, self.W0)           # (N x hidden) — uses BLAS gemm
+        _assert_finite(H0, 'H0')
         H1 = relu(H0)                      # (N x hidden)
+        _assert_finite(H1, 'H1')
 
         # Dropout on hidden layer (training only)
         if training and self.dropout_rate > 0:
@@ -100,9 +163,13 @@ class GCN:
             AH1 = A_norm.dot(H1_drop)
         else:
             AH1 = A_norm @ H1_drop
+        AH1 = np.ascontiguousarray(AH1)
+        _assert_finite(AH1, 'AH1')
 
-        logits = AH1 @ self.W1             # (N x C)
-        Z = softmax(logits)                # (N x C)
+        logits = np.dot(AH1, self.W1)      # (N x C)
+        _assert_finite(logits, 'logits')
+        Z = softmax(logits)                # (N x C); stable (row-max subtracted)
+        _assert_finite(Z, 'Z')
 
         # Cache for backprop
         self._cache = {
@@ -117,6 +184,11 @@ class GCN:
         Backprop through GCN.
         Gradient flows only through train_idx nodes for loss, but
         the graph convolution propagates gradients to all nodes.
+
+        Dense @ dense is again routed through `np.dot` (see forward).
+        Each gradient is finite-checked so a genuine numerical blow-up
+        (e.g. activation explosion or NaN-producing dropout mask)
+        surfaces immediately at the offending matmul.
         """
         c = self._cache
         N = c['Z'].shape[0]
@@ -127,11 +199,14 @@ class GCN:
         dZ[train_idx] = c['Z'][train_idx].copy()
         dZ[train_idx, labels[train_idx]] -= 1
         dZ /= len(train_idx)
+        _assert_finite(dZ, 'dZ')
 
         # Backprop through layer 2: Z = softmax(AH1 @ W1)
         # dL/d(AH1) = dZ @ W1^T
-        dAH1 = dZ @ self.W1.T                               # (N x hidden)
-        dW1  = c['AH1'].T @ dZ                              # (hidden x C)
+        dAH1 = np.dot(dZ, self.W1.T)                        # (N x hidden)
+        _assert_finite(dAH1, 'dAH1')
+        dW1  = np.dot(c['AH1'].T, dZ)                       # (hidden x C)
+        _assert_finite(dW1, 'dW1')
 
         # Backprop through A_norm multiplication: AH1 = A @ H1_drop
         A_norm = c['A_norm']
@@ -139,6 +214,7 @@ class GCN:
             dH1_drop = A_norm.T.dot(dAH1)
         else:
             dH1_drop = A_norm.T @ dAH1
+        dH1_drop = np.ascontiguousarray(dH1_drop)
 
         # Backprop through dropout
         dH1 = dH1_drop * c['mask']
@@ -147,7 +223,8 @@ class GCN:
         dH0 = dH1 * relu_grad(c['H0'])                     # (N x hidden)
 
         # Backprop through layer 1: H0 = AX @ W0
-        dW0 = c['AX'].T @ dH0                              # (F x hidden)
+        dW0 = np.dot(c['AX'].T, dH0)                       # (F x hidden)
+        _assert_finite(dW0, 'dW0')
 
         # L2 regularization
         dW0 += self.weight_decay * self.W0
@@ -184,18 +261,69 @@ def accuracy(preds, labels, idx):
     return np.mean(preds[idx] == labels[idx])
 
 
+def _build_dropedge_adjacency(edge_pairs, n_nodes, drop_rate, rng):
+    """
+    Sample a fresh sub-graph by independently dropping each undirected
+    edge with probability `drop_rate`, mirror it (since the original is
+    symmetric), and return the symmetrically normalized adjacency
+    D^{-1/2}(Â+I)D^{-1/2}. Self-loops are restored by the normalization
+    step, so isolated nodes still receive their own feature.
+    """
+    n = len(edge_pairs)
+    keep_mask = rng.random(n) >= drop_rate
+    kept = edge_pairs[keep_mask]
+    rows = np.concatenate([kept[:, 0], kept[:, 1]])
+    cols = np.concatenate([kept[:, 1], kept[:, 0]])
+    A = sp.csr_matrix((np.ones(len(rows)), (rows, cols)),
+                      shape=(n_nodes, n_nodes))
+    # Self-loops + symmetric normalization, identical to
+    # data_preprocessing.normalize_adjacency.
+    A_hat = A + sp.eye(n_nodes)
+    deg = np.array(A_hat.sum(1)).flatten()
+    D_inv_sqrt = sp.diags(np.power(np.maximum(deg, 1e-12), -0.5))
+    return D_inv_sqrt.dot(A_hat).dot(D_inv_sqrt)
+
+
 def train_gcn(A_norm, X_dense, labels, train_idx, val_idx, test_idx,
               n_hidden=64, lr=0.01, epochs=200, weight_decay=5e-4,
-              dropout=0.5, patience=20, verbose=True):
+              dropout=0.5, patience=20, verbose=True,
+              edge_dropout_rate=0.0, A_raw=None, edge_dropout_seed=None):
     """
     Full training loop with early stopping on validation accuracy.
     Returns trained model and history dict.
+
+    Edge dropout (DropEdge — Rong et al. 2020) — *defense / regularization*
+    -----------------------------------------------------------------------
+    When `edge_dropout_rate > 0`, each epoch independently drops that
+    fraction of edges from `A_raw`, re-normalizes (self-loops preserved),
+    and uses the resulting smaller graph for THAT epoch's forward and
+    backward pass. The model therefore sees many slightly-different
+    graphs during training, which:
+      • reduces over-reliance on any single edge or short path,
+      • acts as graph-level data augmentation, and
+      • measurably improves robustness when test-time inputs are
+        perturbed (random edge add / drop, feature noise, …).
+    Validation / test accuracy are still measured on the FULL clean
+    graph each epoch so early stopping reflects true generalization.
+
+    With the default `edge_dropout_rate=0.0` (and `A_raw=None`), the
+    training loop is byte-identical to the original implementation.
     """
     n_feat    = X_dense.shape[1]
     n_classes = int(labels.max()) + 1
 
     model = GCN(n_feat, n_hidden, n_classes, lr=lr,
                 weight_decay=weight_decay, dropout=dropout)
+
+    use_edge_dropout = (edge_dropout_rate > 0.0) and (A_raw is not None)
+    if use_edge_dropout:
+        # Pre-extract the upper-triangular edge list ONCE so we can
+        # cheaply resample per epoch without rebuilding from sparse.
+        coo = A_raw.tocoo()
+        upper = coo.row < coo.col
+        edge_pairs = np.stack([coo.row[upper], coo.col[upper]], axis=1)
+        n_nodes = A_raw.shape[0]
+        rng = np.random.default_rng(edge_dropout_seed)
 
     best_val_acc = 0
     best_W0 = model.W0.copy()
@@ -205,8 +333,25 @@ def train_gcn(A_norm, X_dense, labels, train_idx, val_idx, test_idx,
     history = {'train_loss': [], 'val_acc': [], 'test_acc': []}
 
     for epoch in range(1, epochs + 1):
-        loss, Z = model.train_epoch(A_norm, X_dense, labels, train_idx)
-        preds = np.argmax(Z, axis=1)
+        # When edge dropout is active, build a fresh per-epoch
+        # adjacency. Otherwise reuse the static A_norm from the caller.
+        if use_edge_dropout:
+            A_norm_epoch = _build_dropedge_adjacency(
+                edge_pairs, n_nodes, edge_dropout_rate, rng,
+            )
+        else:
+            A_norm_epoch = A_norm
+
+        loss, Z = model.train_epoch(A_norm_epoch, X_dense, labels, train_idx)
+
+        if use_edge_dropout:
+            # For early stopping & history, evaluate on the FULL clean
+            # graph so val/test accuracy reflect generalization rather
+            # than this epoch's particular sub-graph.
+            Z_eval = model.forward(A_norm, X_dense, training=False)
+            preds = np.argmax(Z_eval, axis=1)
+        else:
+            preds = np.argmax(Z, axis=1)
 
         val_acc  = accuracy(preds, labels, val_idx)
         test_acc = accuracy(preds, labels, test_idx)

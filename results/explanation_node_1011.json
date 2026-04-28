@@ -1,0 +1,96 @@
+{
+  "node_id": 1011,
+  "predicted_class_idx": 5,
+  "predicted_class": "Rule_Learning",
+  "true_class_idx": 5,
+  "true_class": "Rule_Learning",
+  "confidence": 0.835420362924023,
+  "class_probabilities": [
+    {
+      "class_idx": 5,
+      "probability": 0.835420362924023,
+      "class_name": "Rule_Learning"
+    },
+    {
+      "class_idx": 6,
+      "probability": 0.05335655722605646,
+      "class_name": "Theory"
+    },
+    {
+      "class_idx": 0,
+      "probability": 0.03927457129174334,
+      "class_name": "Case_Based"
+    },
+    {
+      "class_idx": 1,
+      "probability": 0.022548335233833934,
+      "class_name": "Genetic_Algorithms"
+    },
+    {
+      "class_idx": 3,
+      "probability": 0.01899703686573202,
+      "class_name": "Probabilistic_Methods"
+    },
+    {
+      "class_idx": 4,
+      "probability": 0.015268268709704888,
+      "class_name": "Reinforcement_Learning"
+    },
+    {
+      "class_idx": 2,
+      "probability": 0.015134867748906275,
+      "class_name": "Neural_Networks"
+    }
+  ],
+  "top_influential_neighbors": [
+    {
+      "neighbor_id": 1008,
+      "confidence_drop": 0.08682789459702733,
+      "new_confidence": 0.7485924683269957,
+      "neighbor_true_label_idx": 5,
+      "neighbor_true_label": "Rule_Learning"
+    },
+    {
+      "neighbor_id": 1010,
+      "confidence_drop": 0.03826311541197669,
+      "new_confidence": 0.7971572475120463,
+      "neighbor_true_label_idx": 5,
+      "neighbor_true_label": "Rule_Learning"
+    },
+    {
+      "neighbor_id": 1569,
+      "confidence_drop": -0.004119080100483785,
+      "new_confidence": 0.8395394430245068,
+      "neighbor_true_label_idx": 5,
+      "neighbor_true_label": "Rule_Learning"
+    }
+  ],
+  "top_important_features": [
+    {
+      "feature_idx": 485,
+      "confidence_drop": 0.037255752763834304,
+      "new_confidence": 0.7981646101601887
+    },
+    {
+      "feature_idx": 814,
+      "confidence_drop": 0.021962140661401786,
+      "new_confidence": 0.8134582222626212
+    },
+    {
+      "feature_idx": 967,
+      "confidence_drop": 0.014424186235026282,
+      "new_confidence": 0.8209961766889967
+    },
+    {
+      "feature_idx": 358,
+      "confidence_drop": 0.013609337132554966,
+      "new_confidence": 0.821811025791468
+    },
+    {
+      "feature_idx": 135,
+      "confidence_drop": 0.007023084361678533,
+      "new_confidence": 0.8283972785623445
+    }
+  ],
+  "explanation": "Node 1011 was correctly classified as Rule_Learning with 83.5% confidence. The most influential neighbor was node 1008 (Rule_Learning) (\u0394conf=+0.087). The most important active feature was index 485 (\u0394conf=+0.037)."
+}
